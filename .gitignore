@@ -39,3 +39,11 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+# assignment / local artifacts
+fear.json
+scripts/ingested_ids.json
+data/ted_talks_en.csv
+
+# local secrets (keep ignored)
+.env.local
+
