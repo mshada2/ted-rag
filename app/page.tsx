@@ -1,5 +1,4 @@
 "use client";
-<h1 style={{ fontSize: 28, fontWeight: 700, marginBottom: 8 }}>TED-RAG (DEPLOY TEST)</h1>
 
 import { useMemo, useState } from "react";
 
@@ -23,6 +22,14 @@ export default function Home() {
     if (mode === "title_speaker") return "Give me 1 TED talk title and speaker about creativity.";
     return "Ask a question about TED talks (answer must come from retrieved TED transcript chunks).";
   }, [mode]);
+
+  const panelStyle: React.CSSProperties = {
+    whiteSpace: "pre-wrap",
+    padding: 12,
+    background: "rgba(255,255,255,0.06)",
+    border: "1px solid rgba(255,255,255,0.12)",
+    color: "inherit",
+  };
 
   async function run() {
     setLoading(true);
@@ -52,8 +59,9 @@ export default function Home() {
   return (
     <main style={{ maxWidth: 900, margin: "40px auto", padding: 16, fontFamily: "system-ui, sans-serif" }}>
       <h1 style={{ fontSize: 28, fontWeight: 700, marginBottom: 8 }}>TED-RAG</h1>
-      <p style={{ marginTop: 0, color: "#555" }}>
-        Answers must be grounded in retrieved TED transcript context. If not supported: “I don’t know based on the provided TED data.”
+      <p style={{ marginTop: 0, opacity: 0.85 }}>
+        Answers must be grounded in retrieved TED transcript context. If not supported: “I don’t know based on the
+        provided TED data.”
       </p>
 
       <div style={{ display: "flex", gap: 12, alignItems: "center", marginTop: 16 }}>
@@ -82,7 +90,7 @@ export default function Home() {
       </button>
 
       {error && (
-        <div style={{ marginTop: 16, padding: 12, background: "#ffecec", border: "1px solid #ffb3b3" }}>
+        <div style={{ marginTop: 16, padding: 12, background: "rgba(255,0,0,0.12)", border: "1px solid rgba(255,0,0,0.25)" }}>
           <b>Error:</b> {error}
         </div>
       )}
@@ -90,22 +98,16 @@ export default function Home() {
       {data && (
         <div style={{ marginTop: 18 }}>
           <h2 style={{ fontSize: 18, marginBottom: 6 }}>Response</h2>
-          <pre style={{ whiteSpace: "pre-wrap", padding: 12, background: "#f7f7f7", border: "1px solid #ddd" }}>
-            {data.response}
-          </pre>
+          <pre style={panelStyle}>{data.response}</pre>
 
           <details style={{ marginTop: 12 }}>
             <summary style={{ cursor: "pointer", fontWeight: 700 }}>Retrieved context (debug)</summary>
-            <pre style={{ whiteSpace: "pre-wrap", padding: 12, background: "#f7f7f7", border: "1px solid #ddd" }}>
-              {JSON.stringify(data.context, null, 2)}
-            </pre>
+            <pre style={panelStyle}>{JSON.stringify(data.context, null, 2)}</pre>
           </details>
 
           <details style={{ marginTop: 12 }}>
             <summary style={{ cursor: "pointer", fontWeight: 700 }}>Augmented prompt (debug)</summary>
-            <pre style={{ whiteSpace: "pre-wrap", padding: 12, background: "#f7f7f7", border: "1px solid #ddd" }}>
-              {JSON.stringify(data.Augmented_prompt, null, 2)}
-            </pre>
+            <pre style={panelStyle}>{JSON.stringify(data.Augmented_prompt, null, 2)}</pre>
           </details>
         </div>
       )}
