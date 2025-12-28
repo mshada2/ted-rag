@@ -1,23 +1,28 @@
 // app/api/prompt/route.ts
 import { NextResponse } from "next/server";
-import { answerQuestion } from "@/lib/rag";
+import { answerQuestion, type Mode } from "@/lib/rag";
 
 export const runtime = "nodejs";
+
+function isMode(x: any): x is Mode {
+  return x === "qa" || x === "title_list" || x === "title_speaker";
+}
 
 export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
     const question = String(body?.question ?? "").trim();
+    const modeRaw = body?.mode;
+
     if (!question) {
       return NextResponse.json({ error: "Missing 'question' in JSON body." }, { status: 400 });
     }
 
-    const result = await answerQuestion(question);
+    const mode: Mode | undefined = isMode(modeRaw) ? modeRaw : undefined;
+
+    const result = await answerQuestion(question, mode);
     return NextResponse.json(result);
-  } catch (err: any) {
-    return NextResponse.json(
-      { error: "Server error", details: String(err?.message ?? err) },
-      { status: 500 }
-    );
+  } catch (e: any) {
+    return NextResponse.json({ error: String(e?.message ?? e) }, { status: 500 });
   }
 }

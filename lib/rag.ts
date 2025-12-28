@@ -3,19 +3,19 @@ import OpenAI from "openai";
 import { Pinecone } from "@pinecone-database/pinecone";
 
 /**
- * IMPORTANT: Your /api/stats endpoint must reflect these values.
- * The assignment constrains overlap_ratio <= 0.3 and top_k <= 30. :contentReference[oaicite:3]{index=3}
+ * IMPORTANT: /api/stats must reflect these values.
+ * Keep these aligned with scripts/ingest.ts where the real chunking happens.
  */
 export const RAG_CONFIG = {
-  // This is what YOU report; the true chunking is done in your ingest script.
-  // Keep these aligned with scripts/ingest.ts.
   chunk_size: 1024,
   overlap_ratio: 0.2,
-  top_k: 25, // <= 30 per assignment :contentReference[oaicite:4]{index=4}
+  top_k: 25,
   min_score: 0.12,
   chat_model: process.env.LLMOD_CHAT_MODEL ?? "RPRTHPB-gpt-5-mini",
   embed_model: process.env.LLMOD_EMBED_MODEL ?? "RPRTHPB-text-embedding-3-small",
 } as const;
+
+export type Mode = "qa" | "title_list" | "title_speaker";
 
 export type PublicContextChunk = {
   talk_id: string;
@@ -32,6 +32,8 @@ type RetrievedMatch = {
   chunk: string;
   score: number;
 };
+
+const FALLBACK = "I don’t know based on the provided TED data.";
 
 function requireEnv(name: string): string {
   const v = process.env[name];
@@ -52,7 +54,7 @@ function getPineconeIndex() {
 
   const pc = new Pinecone({ apiKey });
 
-  // Support multiple Pinecone SDK shapes without you needing to guess versions:
+  // Support multiple Pinecone SDK shapes:
   const anyPc = pc as any;
   if (typeof anyPc.index === "function") return host ? anyPc.index(indexName, host) : anyPc.index(indexName);
   if (typeof anyPc.Index === "function") return host ? anyPc.Index(indexName, host) : anyPc.Index(indexName);
@@ -89,13 +91,12 @@ async function retrieve(question: string): Promise<RetrievedMatch[]> {
     const md = (m.metadata ?? {}) as Record<string, any>;
     const talk_id = String(md.talk_id ?? md.id ?? "");
     const title = String(md.title ?? "");
-    const chunk = String(md.chunk ?? md.text ?? "");
     const speaker_1 = md.speaker_1 ? String(md.speaker_1) : undefined;
+    const chunk = String(md.chunk ?? md.text ?? "");
 
     let topics: string[] | undefined;
     if (Array.isArray(md.topics)) topics = md.topics.map((x: any) => String(x));
     else if (typeof md.topics === "string") {
-      // tolerate CSV-like string
       topics = md.topics
         .split(",")
         .map((s) => s.trim())
@@ -107,13 +108,12 @@ async function retrieve(question: string): Promise<RetrievedMatch[]> {
     out.push({ talk_id, title, speaker_1, topics, chunk, score });
   }
 
-  // Highest score first
   out.sort((a, b) => b.score - a.score);
   return out;
 }
 
 /**
- * Required system prompt section (must be included or extremely similar). :contentReference[oaicite:5]{index=5}
+ * Required system prompt section (must be included or extremely similar).
  */
 function buildSystemPrompt(): string {
   return [
@@ -122,10 +122,9 @@ function buildSystemPrompt(): string {
     "and transcript passages). You must not use any external",
     "knowledge, the open internet, or information that is not explicitly",
     "contained in the retrieved context. If the answer cannot be",
-    "determined from the provided context, respond: “I don't know",
-    "based on the provided TED data.” Always explain your answer",
-    "using the given context, quoting or paraphrasing the relevant",
-    "transcript or metadata when helpful.",
+    `determined from the provided context, respond: “${FALLBACK}”`,
+    "Always explain your answer using the given context, quoting or paraphrasing",
+    "the relevant transcript or metadata when helpful.",
     "",
     "Additional style rules:",
     "- If the user requests multiple talk titles (e.g., exactly 3), output only titles in a list.",
@@ -134,11 +133,32 @@ function buildSystemPrompt(): string {
   ].join("\n");
 }
 
-
+/**
+ * IMPORTANT:
+ * We keep auto-detection STRICT to avoid accidental mode flips in QA.
+ * (Your UI can pass an explicit mode; the grader may not.)
+ */
 function detectMode(question: string): "title_list" | "title_speaker" | "general" {
   const q = question.toLowerCase();
-  if (q.includes("exactly 3") && q.includes("title")) return "title_list";
-  if (q.includes("provide the title and speaker") || (q.includes("title") && q.includes("speaker"))) return "title_speaker";
+
+  // Multi-title listing: must be explicit
+  if (
+    (q.includes("exactly 3") || q.includes("exactly three")) &&
+    (q.includes("titles") || q.includes("title"))
+  ) {
+    return "title_list";
+  }
+
+  // Title+speaker only when explicitly requested in that combined phrase
+  if (
+    q.includes("title and speaker") ||
+    q.includes("provide the title and speaker") ||
+    q.includes("provide title and speaker") ||
+    q.includes("title & speaker")
+  ) {
+    return "title_speaker";
+  }
+
   return "general";
 }
 
@@ -151,77 +171,59 @@ function buildCandidates(matches: RetrievedMatch[], maxTalks: number): Retrieved
     grouped.set(m.talk_id, arr);
   }
 
-  // For each talk: keep best match as the "candidate", but merge top evidence chunks into candidate.chunk
+  // For each talk: keep best match as candidate, but merge top evidence chunks into candidate.chunk
   const candidates: RetrievedMatch[] = [];
 
   for (const arr of grouped.values()) {
-    // Sort by score descending
     arr.sort((a, b) => b.score - a.score);
 
     const best = arr[0];
-    const topEvidence = arr.slice(0, 2); // keep up to 2 evidence snippets per talk
+    const topEvidence = arr.slice(0, 2);
 
-    const mergedEvidence = topEvidence
-      .map((e) => e.chunk)
-      .join("\n\n---\n\n"); // delimiter so it’s obvious it’s multiple snippets
+    const mergedEvidence = topEvidence.map((e) => e.chunk).join("\n\n---\n\n");
 
     candidates.push({
       ...best,
-      chunk: mergedEvidence, // IMPORTANT: this is now the evidence text we’ll show the model
-      score: best.score,
+      chunk: mergedEvidence,
     });
+
+    if (candidates.length >= maxTalks) break;
   }
 
-  // Sort talks by best score, return top maxTalks
   candidates.sort((a, b) => b.score - a.score);
   return candidates.slice(0, maxTalks);
 }
 
-
-
 function cleanTopicList(topics?: string[]): string[] {
   if (!topics?.length) return [];
-
-  // Handle the case where topics is ["['a','b','c']"] (a single string that looks like a list)
-  if (topics.length === 1) {
-    const t = topics[0].trim();
-    if (t.startsWith("[") && t.endsWith("]")) {
-      const inner = t.slice(1, -1);
-      const parsed = inner
-        .split(",")
-        .map((x) => x.trim().replace(/^['"]|['"]$/g, ""))
-        .filter(Boolean);
-      if (parsed.length) return parsed;
-    }
-  }
-
-  // Normal case: array of strings
-  return topics
-    .map((x) => x.trim().replace(/^['"]|['"]$/g, ""))
+  const flattened = topics
+    .flatMap((t) => (typeof t === "string" ? t.split(",") : []))
+    .map((t) => t.trim())
     .filter(Boolean);
+
+  const cleaned = flattened
+    .map((t) => t.replace(/^\[+|\]+$/g, "").replace(/^'+|'+$/g, "").trim())
+    .filter(Boolean);
+
+  return Array.from(new Set(cleaned)).slice(0, 12);
 }
 
 function clip(text: string, maxChars: number) {
-  const t = text.replace(/\s+/g, " ").trim();
-  if (t.length <= maxChars) return t;
-  return t.slice(0, maxChars - 1) + "…";
+  if (text.length <= maxChars) return text;
+  return text.slice(0, maxChars - 1) + "…";
 }
 
 function buildCandidatesBlock(cands: RetrievedMatch[]): string {
   return cands
     .map((c, i) => {
       const topics = cleanTopicList(c.topics);
-      const speaker = c.speaker_1 ? `SPEAKER: ${c.speaker_1}` : `SPEAKER:`;
-      const topicsLine = `TOPICS: ${JSON.stringify(topics)}`;
-
-      // Evidence comes from c.chunk (now merged by buildCandidates)
-      const evidence = c.chunk ? clip(c.chunk, 700) : "(none)";
+      const evidence = clip(c.chunk, 900);
 
       return [
         `[#${i + 1}] talk_id=${c.talk_id}`,
         `TITLE: ${c.title}`,
-        speaker,
-        topicsLine,
+        `SPEAKER: ${c.speaker_1 ?? ""}`,
+        `TOPICS: ${JSON.stringify(topics)}`,
         `EVIDENCE:\n"${evidence}"`,
         `SCORE: ${c.score}`,
       ].join("\n");
@@ -229,10 +231,7 @@ function buildCandidatesBlock(cands: RetrievedMatch[]): string {
     .join("\n\n");
 }
 
-
-
 function validateTitleSpeakerResponse(resp: string, cands: RetrievedMatch[]): boolean {
-  // Must mention a title AND speaker that appear in candidates (exact substring match).
   const titles = cands.map((c) => c.title).filter(Boolean);
   const speakers = cands.map((c) => c.speaker_1).filter((s): s is string => Boolean(s));
 
@@ -265,17 +264,16 @@ async function callModel(system: string, user: string): Promise<string> {
       { role: "system", content: system },
       { role: "user", content: user },
     ],
-    // gpt-5-mini requires temperature=1 when temperature is specified (you hit this earlier).
-    temperature: 1,
   });
 
-  return res.choices?.[0]?.message?.content?.trim() ?? "";
+  const text = res.choices?.[0]?.message?.content ?? "";
+  return String(text).trim();
 }
 
-export async function answerQuestion(question: string) {
+export async function answerQuestion(question: string, requestedMode?: Mode) {
   const matches = await retrieve(question);
+  const cands = buildCandidates(matches, 8);
 
-  // Public context: always return chunk+score (required output shape). :contentReference[oaicite:6]{index=6}
   const publicContext: PublicContextChunk[] = matches.map((m) => ({
     talk_id: m.talk_id,
     title: m.title,
@@ -284,14 +282,37 @@ export async function answerQuestion(question: string) {
   }));
 
   const system = buildSystemPrompt();
-  const mode = detectMode(question);
 
-  // Build candidates for “must pick from these” prompts
-  const cands = buildCandidates(matches, 8);
+  // Decide mode:
+  // - If UI sends a mode, respect it (qa -> general).
+  // - If grader sends only a question, use strict auto-detect.
+  const inferred = detectMode(question);
+  const mode: "title_list" | "title_speaker" | "general" =
+    requestedMode === "title_list"
+      ? "title_list"
+      : requestedMode === "title_speaker"
+        ? "title_speaker"
+        : requestedMode === "qa"
+          ? "general"
+          : inferred;
+
   const candidatesBlock = buildCandidatesBlock(cands);
 
   let userPrompt = "";
-  if (mode === "title_speaker") {
+  if (mode === "title_list") {
+    userPrompt = [
+      "Choose exactly THREE talk titles from the CANDIDATES that best match the QUESTION.",
+      "Output only the three titles, one per line, with no extra text.",
+      "",
+      "Rules:",
+      "- You MUST copy titles exactly as written in the CANDIDATES.",
+      `- If you cannot find exactly 3 valid titles, respond exactly:\n${FALLBACK}`,
+      "",
+      `QUESTION:\n${question}`,
+      "",
+      `CANDIDATES:\n${candidatesBlock}`,
+    ].join("\n");
+  } else if (mode === "title_speaker") {
     userPrompt = [
       "Choose exactly ONE talk from the CANDIDATES that best matches the QUESTION.",
       "Output format (exactly):",
@@ -299,43 +320,22 @@ export async function answerQuestion(question: string) {
       "Speaker: <speaker>",
       "",
       "How to decide a match:",
-      "- A candidate is a valid match if its TITLE, TOPICS, or CHUNK explicitly mentions the key theme or close synonyms.",
-      "- For 'fear'/'anxiety' queries, treat mentions of fear, anxious/anxiety, worry, panic, stress, or self-doubt as relevant.",
-      "- Prefer the candidate whose CHUNK most directly discusses the theme asked in the QUESTION.",
+      "- A candidate is a valid match if its TITLE, TOPICS, or EVIDENCE explicitly mentions the key theme or close synonyms.",
       "",
       "Rules:",
       "- You MUST copy the Title and Speaker exactly as written in the CANDIDATES.",
-      "- If NONE of the candidates contain the theme (or close synonyms) in TITLE/TOPICS/CHUNK, respond exactly:",
-      "I don't know based on the provided TED data.",
+      `- If NONE of the candidates contain the theme (or close synonyms), respond exactly:\n${FALLBACK}`,
       "",
       `QUESTION:\n${question}`,
       "",
-      `CANDIDATES:\n${candidatesBlock || "(none)"}`,
-  ].join("\n");
-  }
- else if (mode === "title_list") {
-    userPrompt = [
-      "Return a list of exactly 3 talk titles that best match the QUESTION.",
-      "Rules:",
-      "- Output ONLY the titles as a list (no commentary).",
-      "- Choose titles ONLY from the CANDIDATES below.",
-      "- Do not repeat titles.",
-      "- If you cannot find 3 valid titles from the candidates, respond: I don’t know based on the provided TED data.",
-      "",
-      `QUESTION:\n${question}`,
-      "",
-      `CANDIDATES:\n${candidatesBlock || "(none)"}`,
+      `CANDIDATES:\n${candidatesBlock}`,
     ].join("\n");
   } else {
-    // General Q&A with raw transcript chunks
-    const contextBlock = matches
-      .slice(0, RAG_CONFIG.top_k)
-      .map((m, i) => `[#${i + 1}] talk_id=${m.talk_id}\nTITLE: ${m.title}\nCHUNK: ${m.chunk}\nSCORE: ${m.score}`)
-      .join("\n\n");
+    const contextBlock = cands.map((c) => `TITLE: ${c.title}\nSPEAKER: ${c.speaker_1 ?? ""}\nEVIDENCE:\n${c.chunk}`).join("\n\n---\n\n");
 
     userPrompt = [
       "Answer the question using only the CONTEXT below.",
-      "If the answer is not explicitly supported by the context, say: I don’t know based on the provided TED data.",
+      `If the answer is not explicitly supported by the context, say: ${FALLBACK}`,
       "",
       `QUESTION:\n${question}`,
       "",
@@ -345,16 +345,12 @@ export async function answerQuestion(question: string) {
 
   let response = await callModel(system, userPrompt);
 
-  // Hard guardrails: reject hallucinated title/speaker or invalid title-lists.
+  // Hard guardrails
   if (mode === "title_speaker") {
-    if (!validateTitleSpeakerResponse(response, cands)) {
-      response = "I don’t know based on the provided TED data.";
-    }
+    if (!validateTitleSpeakerResponse(response, cands)) response = FALLBACK;
   }
   if (mode === "title_list") {
-    if (!validateTitleListResponse(response, cands, 3)) {
-      response = "I don’t know based on the provided TED data.";
-    }
+    if (!validateTitleListResponse(response, cands, 3)) response = FALLBACK;
   }
 
   return {
